@@ -1,0 +1,864 @@
+diff --git a/Makefile.target b/Makefile.target
+index 6037fed..8dcfde6 100644
+--- a/Makefile.target
++++ b/Makefile.target
+@@ -200,6 +200,9 @@ obj-y += pcnet.o
+ obj-y += rtl8139.o
+ obj-y += e1000.o
+ 
++# Inter-VM PCI shared memory
++obj-y += ivshmem.o
++
+ # Hardware support
+ obj-i386-y = ide/core.o ide/qdev.o ide/isa.o ide/pci.o ide/piix.o
+ obj-i386-y += pckbd.o $(sound-obj-y) dma.o
+diff --git a/hw/ivshmem.c b/hw/ivshmem.c
+new file mode 100644
+index 0000000..a286667
+--- /dev/null
++++ b/hw/ivshmem.c
+@@ -0,0 +1,673 @@
++/*
++ * Inter-VM Shared Memory PCI device.
++ *
++ * Author:
++ *      hamid reza mohebbi <mohebbi.h@gmail.com>
++ *
++ * Based On: cirrus_vga.c and rtl8139.c
++ *
++ * This code is licensed under the GNU GPL v2.
++ */
++
++#include "hw.h"
++#include "console.h"
++#include "pc.h"
++#include "pci.h"
++#include "sysemu.h"
++
++#include "qemu-common.h"
++#include <sys/mman.h>
++#include <sys/socket.h>
++
++#define PCI_COMMAND_IOACCESS                0x0001
++#define PCI_COMMAND_MEMACCESS               0x0002
++#define PCI_COMMAND_BUSMASTER               0x0004
++
++#define DEBUG_IVSHMEM
++#define MAX_EVENT_FDS 16
++
++#ifdef DEBUG_IVSHMEM
++#define IVSHMEM_DPRINTF(fmt, args...)        \
++    do {printf("IVSHMEM: " fmt, ##args); } while (0)
++#else
++#define IVSHMEM_DPRINTF(fmt, args...)
++#endif
++
++#define BROADCAST_VAL ((1 << 8) - 1)
++
++typedef struct IVShmemState {
++    uint16_t intrmask;
++    uint16_t intrstatus;
++    uint16_t doorbell;
++    uint8_t *ivshmem_ptr;
++    unsigned long ivshmem_offset;
++    unsigned int ivshmem_size;
++    unsigned long bios_offset;
++    unsigned int bios_size;
++    target_phys_addr_t base_ctrl;
++    int it_shift;
++    PCIDevice *pci_dev;
++    CharDriverState * chr;
++    CharDriverState * eventfd_chr;
++    unsigned long map_addr;
++    unsigned long map_end;
++    int ivshmem_mmio_io_addr;
++    int eventfds[16]; /* for now we have a limit of 16 inter-connected guests */
++    int eventfd_posn;
++    uint16_t eventfd_bitvec;
++    int num_eventfds;
++} IVShmemState;
++
++typedef struct PCI_IVShmemState {
++    PCIDevice dev;
++    IVShmemState ivshmem_state;
++} PCI_IVShmemState;
++
++typedef struct IVShmemDesc {
++    char name[1024];
++    char * chrdev;
++    int size;
++} IVShmemDesc;
++
++/* registers for the Inter-VM shared memory device */
++enum ivshmem_registers {
++    IntrMask = 0,
++    IntrStatus = 16,
++    Doorbell = 32,
++    IVPosition = 48,
++    IVLiveList = 64,
++    MemSize = 80
++};
++
++static int num_ivshmem_devices = 0;
++static IVShmemDesc ivshmem_desc;
++
++static void ivshmem_map(PCIDevice *pci_dev, int region_num,
++                    pcibus_t addr, pcibus_t size, int type)
++{
++    PCI_IVShmemState *d = (PCI_IVShmemState *)pci_dev;
++    IVShmemState *s = &d->ivshmem_state;
++
++    IVSHMEM_DPRINTF("addr = %u size = %u\n", (uint32_t)addr, (uint32_t)size);
++    cpu_register_physical_memory(addr, s->ivshmem_size, s->ivshmem_offset);
++
++}
++
++void ivshmem_init(const char * optarg) {
++
++    char * temp;
++    char * ivshmem_sz;
++    int size;
++
++    num_ivshmem_devices++;
++
++    /* currently we only support 1 device */
++    if (num_ivshmem_devices > MAX_IVSHMEM_DEVICES) {
++        return;
++    }
++
++    temp = strdup(optarg);
++/*
++    snprintf(ivshmem_desc.name, 1024, "/%s", strsep(&temp,","));
++*/
++    ivshmem_sz=strsep(&temp,",");
++
++    if (ivshmem_sz != NULL) {
++        size = atol(ivshmem_sz);
++    } else {
++        size = -1;
++    }
++
++    ivshmem_desc.chrdev = strsep(&temp,"\0");
++
++    if ( size == -1) {
++        ivshmem_desc.size = TARGET_PAGE_SIZE;
++    } else {
++        ivshmem_desc.size = size*1024*1024;
++    }
++    IVSHMEM_DPRINTF("optarg is %s, name is %s, size is %d, chrdev is %s\n",
++                                        optarg, ivshmem_desc.name,
++                                        ivshmem_desc.size, ivshmem_desc.chrdev);
++}
++
++int ivshmem_get_size(void) {
++    return ivshmem_desc.size;
++}
++
++static void broadcast_eventfds(int val, IVShmemState *s)
++{
++
++    int dest = val >> 4;
++    u_int64_t writelong = val & 0xff;
++
++    for (dest = 1; dest < s->num_eventfds; dest++) {
++
++        if (s->eventfds[dest] != -1) {
++            IVSHMEM_DPRINTF("Writing %ld to VM %d\n", writelong, dest);
++            write(s->eventfds[dest], &(writelong), 8);
++        }
++
++    }
++
++}
++
++/* accessing registers - based on rtl8139 */
++static void ivshmem_update_irq(IVShmemState *s)
++{
++    int isr;
++    isr = (s->intrstatus & s->intrmask) & 0xffff;
++
++    /* don't print ISR resets */
++    if (isr) {
++        IVSHMEM_DPRINTF("Set IRQ to %d (%04x %04x)\n",
++           isr ? 1 : 0, s->intrstatus, s->intrmask);
++    }
++
++    qemu_set_irq(s->pci_dev->irq[0], (isr != 0));
++}
++
++static void ivshmem_mmio_map(PCIDevice *pci_dev, int region_num,
++                       pcibus_t addr, pcibus_t size, int type)
++{
++    PCI_IVShmemState *d = (PCI_IVShmemState *)pci_dev;
++    IVShmemState *s = &d->ivshmem_state;
++
++    cpu_register_physical_memory(addr + 0, 0x100, s->ivshmem_mmio_io_addr);
++}
++
++static void ivshmem_IntrMask_write(IVShmemState *s, uint32_t val)
++{
++    IVSHMEM_DPRINTF("IntrMask write(w) val = 0x%04x\n", val);
++
++    s->intrmask = val;
++
++    ivshmem_update_irq(s);
++}
++
++static uint32_t ivshmem_IntrMask_read(IVShmemState *s)
++{
++    uint32_t ret = s->intrmask;
++
++    IVSHMEM_DPRINTF("intrmask read(w) val = 0x%04x\n", ret);
++
++    return ret;
++}
++
++static void ivshmem_IntrStatus_write(IVShmemState *s, uint32_t val)
++{
++    IVSHMEM_DPRINTF("IntrStatus write(w) val = 0x%04x\n", val);
++
++    s->intrstatus = val;
++
++    ivshmem_update_irq(s);
++    return;
++}
++
++static uint32_t ivshmem_IntrStatus_read(IVShmemState *s)
++{
++    uint32_t ret = s->intrstatus;
++
++    /* reading ISR clears all interrupts */
++    s->intrstatus = 0;
++
++    ivshmem_update_irq(s);
++
++    return ret;
++}
++
++static void ivshmem_io_writew(void *opaque, uint8_t addr, uint32_t val)
++{
++    IVShmemState *s = opaque;
++
++    // 32-bits are written to the address
++    int dest = val >> 8;
++    u_int64_t writelong = val & 0xff;
++
++    IVSHMEM_DPRINTF("writing 0x%x to 0x%lx\n", addr, (unsigned long) opaque);
++
++    addr &= 0xfe;
++
++    switch (addr)
++    {
++        case IntrMask:
++            ivshmem_IntrMask_write(s, val);
++            break;
++
++        case IntrStatus:
++            ivshmem_IntrStatus_write(s, val);
++            break;
++
++        case Doorbell:
++            IVSHMEM_DPRINTF("val is %d\n", val);
++
++            if (dest == BROADCAST_VAL) {
++                broadcast_eventfds(val, s);
++            } else if (dest <= s->num_eventfds) {
++                IVSHMEM_DPRINTF("Writing %ld to VM %d\n", writelong, dest);
++                write(s->eventfds[dest], &(writelong), 8);
++            } else {
++                IVSHMEM_DPRINTF("Invalid %ld to VM %d\n", writelong, dest);
++            }
++
++            break;
++       default:
++            IVSHMEM_DPRINTF("why are we writing 0x%x\n", addr);
++    }
++}
++
++static void ivshmem_io_writel(void *opaque, uint8_t addr, uint32_t val)
++{
++    IVSHMEM_DPRINTF("We shouldn't be writing longs\n");
++}
++
++static void ivshmem_io_writeb(void *opaque, uint8_t addr, uint32_t val)
++{
++    IVSHMEM_DPRINTF("We shouldn't be writing bytes\n");
++}
++
++static uint32_t ivshmem_io_readw(void *opaque, uint8_t addr)
++{
++
++    IVShmemState *s = opaque;
++    uint32_t ret;
++
++    switch (addr)
++    {
++        case IntrMask:
++            ret = ivshmem_IntrMask_read(s);
++            break;
++        case IntrStatus:
++            ret = ivshmem_IntrStatus_read(s);
++            break;
++
++        case IVPosition:
++            /* return my id in the ivshmem list */
++            ret = s->eventfd_posn;
++            break;
++        case IVLiveList:
++            /* return the list of live VMs id for ivshmem */
++            ret = s->eventfd_bitvec;
++            break;
++
++        default:
++            IVSHMEM_DPRINTF("why are we reading 0x%x\n", addr);
++            ret = 0;
++    }
++
++    return ret;
++}
++
++static uint32_t ivshmem_io_readl(void *opaque, uint8_t addr)
++{
++    IVSHMEM_DPRINTF("We shouldn't be reading longs\n");
++    return 0;
++}
++
++static uint32_t ivshmem_io_readb(void *opaque, uint8_t addr)
++{
++    IVSHMEM_DPRINTF("We shouldn't be reading bytes\n");
++
++    return 0;
++}
++
++static void ivshmem_mmio_writeb(void *opaque,
++                                target_phys_addr_t addr, uint32_t val)
++{
++    ivshmem_io_writeb(opaque, addr & 0xFF, val);
++}
++
++static void ivshmem_mmio_writew(void *opaque,
++                                target_phys_addr_t addr, uint32_t val)
++{
++    ivshmem_io_writew(opaque, addr & 0xFF, val);
++}
++
++static void ivshmem_mmio_writel(void *opaque,
++                                target_phys_addr_t addr, uint32_t val)
++{
++    ivshmem_io_writel(opaque, addr & 0xFF, val);
++}
++
++static uint32_t ivshmem_mmio_readb(void *opaque, target_phys_addr_t addr)
++{
++    return ivshmem_io_readb(opaque, addr & 0xFF);
++}
++
++static uint32_t ivshmem_mmio_readw(void *opaque, target_phys_addr_t addr)
++{
++    uint32_t val = ivshmem_io_readw(opaque, addr & 0xFF);
++    return val;
++}
++
++static uint32_t ivshmem_mmio_readl(void *opaque, target_phys_addr_t addr)
++{
++    uint32_t val = ivshmem_io_readl(opaque, addr & 0xFF);
++    return val;
++}
++
++static CPUReadMemoryFunc *ivshmem_mmio_read[3] = {
++    ivshmem_mmio_readb,
++    ivshmem_mmio_readw,
++    ivshmem_mmio_readl,
++};
++
++static CPUWriteMemoryFunc *ivshmem_mmio_write[3] = {
++    ivshmem_mmio_writeb,
++    ivshmem_mmio_writew,
++    ivshmem_mmio_writel,
++};
++
++
++static void ivshmem_receive(void *opaque, const uint8_t *buf, int size)
++{
++    IVShmemState *s = opaque;
++
++    ivshmem_IntrStatus_write(s, *buf);
++
++    IVSHMEM_DPRINTF("ivshmem_receive 0x%02x\n", *buf);
++}
++
++static void ivshmem_event(void *opaque, int event)
++{
++//    IVShmemState *s = opaque;
++    IVSHMEM_DPRINTF("ivshmem_event %d\n", event);
++}
++
++static int ivshmem_can_receive(void * opaque)
++{
++    return 8;
++}
++
++static CharDriverState* create_eventfd_chr_device(void * opaque, int eventfd)
++{
++    // create a event character device based on the passed eventfd
++    IVShmemState *s = opaque;
++    CharDriverState * chr;
++
++    chr = qemu_chr_open_eventfd(eventfd);
++
++    if (chr == NULL) {
++        IVSHMEM_DPRINTF("creating eventfd for eventfd %d failed\n", eventfd);
++        exit(-1);
++    }
++
++    qemu_chr_add_handlers(chr, ivshmem_can_receive, ivshmem_receive,
++                      ivshmem_event, s);
++
++    return chr;
++
++}
++
++static int check_shm_size(IVShmemState *s, int shmemfd) {
++    /* check that the guest isn't going to try and map more memory than the
++     * card server allocated return -1 to indicate error */
++
++    struct stat buf;
++
++    fstat(shmemfd, &buf);
++
++    if (s->ivshmem_size > buf.st_size) {
++        fprintf(stderr, "IVSHMEM ERROR: Requested memory size greater");
++        fprintf(stderr, " than shared object size (%d > %ld)\n",
++                                          s->ivshmem_size, buf.st_size);
++        return -1;
++    } else {
++        return 0;
++    }
++}
++
++static void ivshmem_read(void *opaque, const uint8_t * buf, int flags)
++{
++    IVShmemState *s = opaque;
++    int incoming_fd, tmp_fd;
++    long incoming_posn;
++
++    memcpy(&incoming_posn, buf, sizeof(long));
++    /* pick off s->chr->msgfd and store it, posn should accompany msg */
++    tmp_fd = qemu_chr_get_msgfd(s->chr);
++    IVSHMEM_DPRINTF("posn is %ld, fd is %d\n", incoming_posn, tmp_fd);
++
++    if (tmp_fd == -1) {
++        s->eventfd_posn = incoming_posn;
++        return;
++    }
++
++    /* because of the implementation of get_msgfd, we need a dup */
++    incoming_fd = dup(tmp_fd);
++
++    /* the zero is the shmem region */
++    if (incoming_posn == 0) {
++
++        s->eventfd_bitvec = 0;
++        s->num_eventfds = 0;
++
++        s->eventfds[incoming_posn] = incoming_fd;
++
++        if (check_shm_size(s, s->eventfds[0]) == -1) {
++            exit(-1);
++        }
++
++        if (mmap(s->ivshmem_ptr, ivshmem_desc.size, PROT_READ|PROT_WRITE,
++                    MAP_SHARED|MAP_FIXED, s->eventfds[0], 0) == MAP_FAILED)
++        {
++            fprintf(stderr, "kvm_ivshmem: could not mmap shared file\n");
++            exit(-1);
++        }
++
++    } else {
++        /* this is an eventfd for a particular guest VM */
++        IVSHMEM_DPRINTF("eventfds[%ld] = %d\n", incoming_posn, incoming_fd);
++        s->eventfds[incoming_posn] = incoming_fd;
++
++        /* bitmap to keep track of live VMs */
++        s->eventfd_bitvec |= 1 << incoming_posn;
++
++        /* keep track of the maximum VM ID */
++        if (incoming_posn > s->num_eventfds) {
++            s->num_eventfds = incoming_posn;
++        }
++
++        /* initialize char device for callback on my eventfd */
++        if (incoming_posn == s->eventfd_posn) {
++            s->eventfd_chr = create_eventfd_chr_device(s, s->eventfds[s->eventfd_posn]);
++        }
++    }
++
++    return;
++}
++
++#if 0
++static void ivshmem_recvmsg(void *opaque, struct msghdr * msg, int flags)
++{
++
++    IVShmemState *s = opaque;
++    struct cmsghdr *cmptr;
++    struct iovec *iov;
++    long param;
++    long msg_size;
++
++    iov = msg->msg_iov;
++
++    memcpy(&param, iov->iov_base, sizeof param);
++
++    IVSHMEM_DPRINTF("Inside Recvmsg (%ld)\n", param);
++    for (cmptr = CMSG_FIRSTHDR(msg); cmptr != NULL;
++        cmptr = CMSG_NXTHDR(msg, cmptr)) {
++        if (cmptr->cmsg_level != SOL_SOCKET ||
++            cmptr->cmsg_type != SCM_RIGHTS) {
++                printf("read msg_size = %ld\n", msg_size);
++                continue;
++        }
++
++        // is eventfd_posn uninitialized?  Then this is the initial list of eventfds
++        if (s->eventfd_posn == -1) {
++
++            s->eventfd_bitvec = 0;
++            msg_size = sizeof(int) * (param + 1);
++            s->eventfds = (int *)malloc(msg_size);
++            s->num_eventfds = param + 1;
++            s->eventfd_posn = param;
++
++            memcpy(s->eventfds, CMSG_DATA(cmptr), msg_size);
++            IVSHMEM_DPRINTF("I am %d, receiving %d fds\n", s->eventfd_posn, s->num_eventfds);
++            IVSHMEM_DPRINTF("broadcast enabled - %d\n", BROADCAST_VAL);
++            IVSHMEM_DPRINTF("shmemfd is %d\n", s->eventfds[0]);
++            IVSHMEM_DPRINTF("My fd is %d\n", s->eventfds[s->eventfd_posn]);
++
++            /* presume all eventfds are live, we will be notified of dead ones */
++            s->eventfd_bitvec = (1 << (s->num_eventfds)) - 1;
++            s->eventfd_bitvec &= ~1; /* posn 0 is not an eventfd, it's the shared memory fd */
++
++            if (check_shm_size(s, s->eventfds[0]) == -1) {
++                exit(-1);
++            }
++
++            if (mmap(s->ivshmem_ptr, ivshmem_desc.size, PROT_READ|PROT_WRITE,
++                        MAP_SHARED|MAP_FIXED, s->eventfds[0], 0) == MAP_FAILED)
++            {
++                fprintf(stderr, "kvm_ivshmem: could not mmap shared file\n");
++                exit(-1);
++            }
++
++
++            // initialize char device for callback on my eventfd
++            s->eventfd_chr = create_eventfd_chr_device(s, s->eventfds[s->eventfd_posn]);
++
++            return;
++        }
++
++        // at this point we know this is an update
++        // the param is then the position of a new fd
++        if (param >= s->num_eventfds) {
++            s->eventfds = realloc(s->eventfds, sizeof(int) * (param + 1));
++        }
++
++        msg_size = sizeof(int);
++
++        // copy the new fd into its posn
++        memcpy(&(s->eventfds[param]), CMSG_DATA(cmptr), msg_size);
++
++        s->num_eventfds = param + 1;
++        s->eventfd_bitvec |= 1 << param;
++
++        IVSHMEM_DPRINTF("[update] new bitvec is %d\n", s->eventfd_bitvec);
++        IVSHMEM_DPRINTF("[update] s->eventfds[%ld] is %d\n", param,s->eventfds[param]);
++
++    }
++
++    // notification of a dead guest
++    // a negative number indicates a kill
++
++    if (param < 0) {
++        int index = -param;
++
++        IVSHMEM_DPRINTF("%d < %d || %d > 0\n", index, s->eventfds[index], s->num_eventfds);
++        if ((index < s->num_eventfds) || (s->eventfds[index] > 0)) {
++            s->eventfds[index] = -1;
++            // turn off the bit in the bit vector
++            s->eventfd_bitvec &= ~(1 << index);
++            IVSHMEM_DPRINTF("[kill] s->eventfds[%d] is %d\n", index,s->eventfds[index]);
++        }
++
++        return;
++
++    }
++
++}
++#endif
++
++int pci_ivshmem_init(PCIBus *bus)
++{
++    PCI_IVShmemState *d;
++    IVShmemState *s;
++    uint8_t *pci_conf;
++
++    IVSHMEM_DPRINTF("shared file is %s\n", ivshmem_desc.name);
++    d = (PCI_IVShmemState *)pci_register_device(bus, "kvm_ivshmem",
++                                           sizeof(PCI_IVShmemState),
++                                           -1, NULL, NULL);
++    if (!d) {
++        return -1;
++    }
++
++    s = &d->ivshmem_state;
++
++    /* allocate shared memory RAM */
++    s->ivshmem_offset = qemu_ram_alloc(ivshmem_desc.size);
++    IVSHMEM_DPRINTF("size is = %d\n", ivshmem_desc.size);
++    IVSHMEM_DPRINTF("ivshmem ram offset = %ld\n", s->ivshmem_offset);
++
++    s->ivshmem_ptr = qemu_get_ram_ptr(s->ivshmem_offset);
++
++    s->pci_dev = &d->dev;
++    s->ivshmem_size = ivshmem_desc.size;
++
++    pci_conf = d->dev.config;
++    pci_conf[0x00] = 0xf4; // Qumranet vendor ID 0x5002
++    pci_conf[0x01] = 0x1a;
++    pci_conf[0x02] = 0x10;
++    pci_conf[0x03] = 0x11;
++    pci_conf[0x04] = PCI_COMMAND_IOACCESS | PCI_COMMAND_MEMACCESS;
++    pci_conf[0x0a] = 0x00; // RAM controller
++    pci_conf[0x0b] = 0x05;
++    pci_conf[0x0e] = 0x00; // header_type
++
++    pci_conf[PCI_INTERRUPT_PIN] = 1; // we are going to support interrupts
++
++    /* XXX: ivshmem_desc.size must be a power of two */
++
++    s->ivshmem_mmio_io_addr = cpu_register_io_memory(ivshmem_mmio_read,
++                                    ivshmem_mmio_write, s);
++
++    /* region for registers*/
++    pci_register_bar(&d->dev, 0, 0x100,
++                           PCI_BASE_ADDRESS_SPACE_MEMORY, ivshmem_mmio_map);
++
++    /* region for shared memory */
++    pci_register_bar(&d->dev, 1, ivshmem_desc.size,
++                           PCI_BASE_ADDRESS_SPACE_MEMORY, ivshmem_map);
++
++    if (ivshmem_desc.chrdev != NULL) {
++        if (strncmp(ivshmem_desc.chrdev, "unix:", 5) == 0) {
++
++            /* if we get a UNIX socket as the parameter we will talk
++             * to the ivshmem server*/
++            char label[32];
++
++            s->eventfd_posn = -1;
++
++            snprintf(label, 32, "ivshmem_chardev");
++            s->chr = qemu_chr_open(label, ivshmem_desc.chrdev, NULL);
++            if (s->chr == NULL) {
++                fprintf(stderr, "No server listening on %s\n",
++                                                        ivshmem_desc.chrdev);
++                exit(-1);
++            }
++
++//            tcp_switch_to_recvmsg_handlers(s->chr);
++
++            qemu_chr_add_handlers(s->chr, ivshmem_can_receive, ivshmem_read,
++                              ivshmem_event, s);
++        } else {
++            /* just map the file, we're not using a server */
++            int shmem_fd;
++
++            if ((shmem_fd=shm_open(ivshmem_desc.chrdev, O_CREAT|O_RDWR,
++                            S_IRWXU|S_IRWXG|S_IRWXO)) < 0) {
++                fprintf(stderr, "kvm_shmem: could not open shared file\n");
++                exit(-1);
++            }
++
++            /* mmap onto PCI device's memory */
++            ftruncate(shmem_fd, ivshmem_desc.size);
++            if (mmap(s->ivshmem_ptr, ivshmem_desc.size, PROT_READ|PROT_WRITE,
++                        MAP_SHARED|MAP_FIXED, shmem_fd, 0)  == MAP_FAILED) {
++                fprintf(stderr, "kvm_ivshmem: could not mmap shared file\n");
++                exit(-1);
++            }
++        }
++    }
++
++    return 0;
++}
++
+diff --git a/hw/pc.c b/hw/pc.c
+index 51603f8..c10b9c9 100644
+--- a/hw/pc.c
++++ b/hw/pc.c
+@@ -76,6 +76,8 @@ static PCII440FXState *i440fx_state;
+ 
+ qemu_irq *ioapic_irq_hack;
+ 
++extern int ivshmem_enabled;
++
+ typedef struct isa_irq_state {
+     qemu_irq *i8259;
+     qemu_irq *ioapic;
+@@ -1162,6 +1164,10 @@ static void pc_init1(ram_addr_t ram_size,
+         }
+     }
+ 
++    if (pci_enabled && ivshmem_enabled) {
++        pci_ivshmem_init(pci_bus);
++    }
++
+     rtc_state = rtc_init(2000);
+ 
+     qemu_register_boot_set(pc_boot_set, rtc_state);
+diff --git a/hw/pc.h b/hw/pc.h
+index b00f311..ec3c366 100644
+--- a/hw/pc.h
++++ b/hw/pc.h
+@@ -167,6 +167,9 @@ void isa_ne2000_init(int base, int irq, NICInfo *nd);
+ 
+ void extboot_init(BlockDriverState *bs, int cmd);
+ 
++/* ivshmem.c */
++int pci_ivshmem_init(PCIBus *bus);
++
+ int cpu_is_bsp(CPUState *env);
+ 
+ #endif
+diff --git a/qemu-char.c b/qemu-char.c
+index b13f8d4..ebf2bc8 100644
+--- a/qemu-char.c
++++ b/qemu-char.c
+@@ -1704,6 +1704,7 @@ static CharDriverState *qemu_chr_open_win_pipe(QemuOpts *opts)
+     WinCharState *s;
+ 
+     chr = qemu_mallocz(sizeof(CharDriverState));
++
+     s = qemu_mallocz(sizeof(WinCharState));
+     chr->opaque = s;
+     chr->chr_write = win_chr_write;
+@@ -2047,6 +2048,12 @@ static void tcp_chr_read(void *opaque)
+     }
+ }
+ 
++CharDriverState *qemu_chr_open_eventfd(int eventfd){
++
++    return qemu_chr_open_fd(eventfd, eventfd);
++
++}
++
+ static void tcp_chr_connect(void *opaque)
+ {
+     CharDriverState *chr = opaque;
+diff --git a/qemu-char.h b/qemu-char.h
+index bcc0766..9a0d2c0 100644
+--- a/qemu-char.h
++++ b/qemu-char.h
+@@ -93,6 +93,9 @@ void qemu_chr_info_print(Monitor *mon, const QObject *ret_data);
+ void qemu_chr_info(Monitor *mon, QObject **ret_data);
+ CharDriverState *qemu_chr_find(const char *name);
+ 
++/* add an eventfd to the qemu devices that are polled */
++CharDriverState *qemu_chr_open_eventfd(int eventfd);
++
+ extern int term_escape_char;
+ 
+ /* async I/O support */
+diff --git a/qemu-options.hx b/qemu-options.hx
+index 812d067..4a415d1 100644
+--- a/qemu-options.hx
++++ b/qemu-options.hx
+@@ -1599,6 +1599,18 @@ STEXI
+ Setup monitor on chardev @var{name}.
+ ETEXI
+ 
++DEF("ivshmem", HAS_ARG, QEMU_OPTION_ivshmem, \
++    "-ivshmem size,unix:file connects to shared memory PCI card server \
++    listening on unix domain socket 'path' of at least 'size' (in MB) and \
++    exposes  as a PCI device in the guest\n")
++STEXI
++@item -ivshmem @var{size},unix:@var{file}
++Connects to a shared memory PCI server at UDS @var{file} that shares a POSIX
++shared object of size @var{size} and creates a PCI device of the same size that
++maps the shared object (received from the server) into the device for guests to
++access.  The servers also sends eventfds to the guest to support interrupts.
++ETEXI
++
+ DEF("pidfile", HAS_ARG, QEMU_OPTION_pidfile, \
+     "-pidfile file   write PID to 'file'\n")
+ STEXI
+diff --git a/sysemu.h b/sysemu.h
+index a545a2b..b106c5a 100644
+--- a/sysemu.h
++++ b/sysemu.h
+@@ -243,6 +243,14 @@ extern CharDriverState *parallel_hds[MAX_PARALLEL_PORTS];
+ 
+ extern CharDriverState *virtcon_hds[MAX_VIRTIO_CONSOLES];
+ 
++/* inter-VM shared memory devices */
++
++#define MAX_IVSHMEM_DEVICES 1
++
++extern CharDriverState * ivshmem_chardev;
++void ivshmem_init(const char * optarg);
++int ivshmem_get_size(void);
++
+ #define TFR(expr) do { if ((expr) != -1) break; } while (errno == EINTR)
+ 
+ #ifdef HAS_AUDIO
+diff --git a/vl.c b/vl.c
+index 9edea10..0eed689 100644
+--- a/vl.c
++++ b/vl.c
+@@ -194,6 +194,7 @@ int autostart;
+ static int rtc_utc = 1;
+ static int rtc_date_offset = -1; /* -1 means no change */
+ QEMUClock *rtc_clock;
++int ivshmem_enabled = 0;
+ int vga_interface_type = VGA_NONE;
+ #ifdef TARGET_SPARC
+ int graphic_width = 1024;
+@@ -212,6 +213,8 @@ int no_quit = 0;
+ CharDriverState *serial_hds[MAX_SERIAL_PORTS];
+ CharDriverState *parallel_hds[MAX_PARALLEL_PORTS];
+ CharDriverState *virtcon_hds[MAX_VIRTIO_CONSOLES];
++CharDriverState *ivshmem_chardev;
++const char * ivshmem_device;
+ #ifdef TARGET_I386
+ int win2k_install_hack = 0;
+ int rtc_td_hack = 0;
+@@ -4982,6 +4985,8 @@ int main(int argc, char **argv, char **envp)
+     kernel_cmdline = "";
+     cyls = heads = secs = 0;
+     translation = BIOS_ATA_TRANSLATION_AUTO;
++    ivshmem_device = NULL;
++    ivshmem_chardev = NULL;
+ 
+     for (i = 0; i < MAX_NODES; i++) {
+         node_mem[i] = 0;
+@@ -5450,6 +5455,10 @@ int main(int argc, char **argv, char **envp)
+                 add_device_config(DEV_PARALLEL, optarg);
+                 default_parallel = 0;
+                 break;
++            case QEMU_OPTION_ivshmem:
++                ivshmem_device = optarg;
++                ivshmem_enabled = 1;
++                break;
+ 	    case QEMU_OPTION_loadvm:
+ 		loadvm = optarg;
+ 		break;
+@@ -5960,6 +5969,10 @@ int main(int argc, char **argv, char **envp)
+     if (ram_size == 0)
+         ram_size = DEFAULT_RAM_SIZE * 1024 * 1024;
+ 
++    if (ivshmem_enabled) {
++        ivshmem_init(ivshmem_device);
++    }
++
+     /* init the dynamic translator */
+     cpu_exec_init_all(tb_size * 1024 * 1024);
+ 
