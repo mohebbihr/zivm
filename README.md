@@ -1,2 +1,6 @@
 # zivm
-This repository contains the source of Hamidreza Mohebbi's M.Sc. thesis project entitled "ZIVM: A Zero-Copy Inter-VM Communication Mechanism
+This repository contains the source of Hamidreza Mohebbi's M.Sc. thesis project entitled "ZIVM: A Zero-Copy Inter-VM Communication Mechanism. 
+
+Nowadays, virtualization technology (VT) becomes an integral part of academic and industrial researches in distributed systems like cluster and cloud computing, since it provides many substantial benefits for traditional, especially large scale computing environments. In this paper we focused on improving the communication performance of virtualized systems, especially communication between virtualized machines (VM)communication performance. We propose a distributed virtual shared memory nicknamed ZIVM providing near-native inter-VM communication performance preserving programming with minimum modification in existing codes,and transparency. ZIVM is implemented on a hosted VM upon KVM as virtual machine monitor (VMM) using C++ language. Evaluation results demonstrated the superiority of our proposed inter-VM communication approach in terms of lowest network latency and highest network throughput than other major inter-VM communication approaches,as well as than native communication between VMs.
+
+The results of this research is published by the Computer and Information Science Journal on 2011. You can read this paper and cite it using the below link: http://www.ccsenet.org/journal/index.php/cis/article/view/6209
